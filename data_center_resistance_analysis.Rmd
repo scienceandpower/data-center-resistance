@@ -1,0 +1,1603 @@
+---
+title: "Data Center Siting, Resistance, and Cancellation"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: hide
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = FALSE,
+                      dev = "png", dpi = 300)
+
+library(tidyverse)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(broom)
+
+options(scipen = 999)
+
+ETL_DIR <- "data"
+
+nat_bm        <- read_csv(file.path(ETL_DIR, "nat_benchmarks.csv"), show_col_types = FALSE)
+NAT_INCOME    <- nat_bm$nat_income
+NAT_COLLEGE   <- nat_bm$nat_college
+NAT_HOMEOWNER <- nat_bm$nat_homeowner
+
+
+group_labels <- c(
+  operating         = "Currently\nOperating",
+  recently_proposed = "Recently\nProposed",
+  pending           = "Pending",
+  cancelled         = "Cancelled/\nSuspended"
+)
+
+group_colors <- c(
+  "Currently\nOperating"  = "#1565C0",
+  "Recently\nProposed"    = "#2E7D32",
+  "Pending"               = "#F57C00",
+  "Cancelled/\nSuspended" = "#C62828"
+)
+
+sig_colors <- c(
+  "Not sig. different from national" = "grey55",
+  "Significantly ABOVE national"     = "#1565C0",
+  "Significantly BELOW national"     = "#C62828"
+)
+
+set.seed(42)
+boot_median_ci <- function(x, B = 2000, conf = 0.95) {
+  boots <- replicate(B, median(sample(x, replace = TRUE)))
+  setNames(quantile(boots, c((1 - conf)/2, 1 - (1 - conf)/2)), c("lo", "hi"))
+}
+```
+
+```{r load-data, include=FALSE}
+dc_raw    <- read_csv(file.path(ETL_DIR, "datacenter_census_etl.csv"),  show_col_types = FALSE)
+urban_etl <- read_csv(file.path(ETL_DIR, "urban_rural_tract_etl.csv"),  show_col_types = FALSE)
+
+dc <- dc_raw |>
+  left_join(urban_etl, by = "geo_tract_geoid") |>
+  mutate(
+    pushback = case_when(
+      str_trim(community_pushback) == "Yes" ~ TRUE,
+      status == "Unknown"                   ~ TRUE,  # verified: this facility has documented pushback
+      TRUE                                  ~ FALSE
+    ),
+    is_operating         = status %in% c("Operating", "Expanding"),
+    is_recently_proposed = !status %in% c("Operating", "Expanding"),
+    is_pending           = status %in% c("Proposed", "Approved/Permitted/Under construction"),
+    is_cancelled         = status %in% c("Suspended", "Cancelled"),
+    pct_college_tract    = education_bachelors_tract + education_grad_tract,
+    pct_lths             = education_lths_tract,
+    pct_knowledge        = industry_info_tract + industry_professional_tract + industry_finance_tract,
+    pct_industrial       = industry_manufacturing_tract + industry_construction_tract + industry_transport_tract,
+    pct_occ_mgmt         = occupation_mgmt_tract,
+    pct_occ_prod         = occupation_production_tract,
+    pct_urban            = pct_urban_2020
+  )
+
+site_colors <- c("Currently\nOperating" = "#1565C0", "Recently\nProposed" = "#2E7D32")
+site_levels <- c("Currently\nOperating", "Recently\nProposed")
+
+dc_site <- dc |>
+  filter(is_operating | is_recently_proposed) |>
+  mutate(grp = factor(
+    if_else(is_operating, "Currently\nOperating", "Recently\nProposed"),
+    levels = site_levels
+  ))
+```
+
+## Essential Background
+
+This analysis looks at the characteristics of neighborhoods across three stages of the recent data center buildout and resistance movement:
+
+**Siting:** What kinds of neighborhoods are being targeted for data centers?
+
+**Fighting:** What kinds of neighborhoods are pushing back against data centers?
+
+**Spiking:** What kinds of neighborhoods are effectively disrupting proposed data centers?
+
+Further details on terminology, materials, and methods are in the **Methods & Housekeeping** section at the end of this file.
+
+## Siting {.tabset}
+
+### Education (BA+)
+
+```{r site-edu-setup}
+dc_edu <- dc_site |> filter(!is.na(pct_college_tract))
+
+edu_sum <- dc_edu |>
+  group_by(grp) |>
+  summarise(
+    n      = n(),
+    median = median(pct_college_tract),
+    .groups = "drop"
+  )
+
+rp_edu    <- dc_edu$pct_college_tract[dc_edu$grp == "Recently\nProposed"]
+op_edu    <- dc_edu$pct_college_tract[dc_edu$grp == "Currently\nOperating"]
+rp_edu_md <- edu_sum$median[edu_sum$grp == "Recently\nProposed"]
+op_edu_md <- edu_sum$median[edu_sum$grp == "Currently\nOperating"]
+t1_edu    <- t.test(rp_edu, mu = NAT_COLLEGE)
+t2_edu    <- t.test(rp_edu, op_edu)
+rp_edu_ci <- boot_median_ci(rp_edu)
+op_edu_ci <- boot_median_ci(op_edu)
+```
+
+```{r site-edu-density, fig.width=10, fig.height=6, echo=FALSE}
+vl_edu    <- edu_sum |> select(grp, median_val = median)
+ci_edu    <- tibble(grp  = c("Currently\nOperating", "Recently\nProposed"),
+                   xmin = c(op_edu_ci["lo"],         rp_edu_ci["lo"]),
+                   xmax = c(op_edu_ci["hi"],         rp_edu_ci["hi"]))
+
+ggplot(dc_edu, aes(x = pct_college_tract, color = grp, fill = grp)) +
+  geom_rect(data = ci_edu, aes(xmin = xmin, xmax = xmax, fill = grp),
+            ymin = -Inf, ymax = Inf, alpha = 0.15, inherit.aes = FALSE, show.legend = FALSE) +
+  geom_density(alpha = 0.12, linewidth = 0.85) +
+  geom_vline(data = vl_edu, aes(xintercept = median_val, color = grp),
+             linetype = "dashed", linewidth = 0.85) +
+  geom_vline(xintercept = NAT_COLLEGE, color = "grey30", linetype = "dotted", linewidth = 0.9) +
+  annotate("text", x = NAT_COLLEGE + 0.015, y = Inf,
+           label = paste0("National\n(", percent(NAT_COLLEGE, 0.1), ")"),
+           color = "grey30", vjust = 1.6, hjust = 0, size = 3.0) +
+  geom_text(data = vl_edu, aes(x = median_val, y = Inf, label = percent(median_val, 0.1), color = grp),
+            vjust = 3.8, hjust = -0.15, size = 3.1, show.legend = FALSE) +
+  scale_x_continuous(labels = percent_format(1), limits = c(0, 1),
+                     name = "College-educated") +
+  scale_color_manual(name = NULL, values = site_colors) +
+  scale_fill_manual(name = NULL, values = site_colors) +
+  labs(title    = "Educational Attainment (BA+) in Data Center Neighborhoods",
+       caption  = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com.") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "top",
+        axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.title.y = element_blank())
+```
+
+<small>*Dashed lines = group medians; shaded bands = 95% bootstrap CI on the median; dotted line = national average.*</small>
+
+```{r site-edu-table, echo=FALSE}
+bind_rows(
+  edu_sum |>
+    transmute(
+      Group          = str_replace_all(as.character(grp), "\n", " "),
+      N              = n,
+      `Median BA+`   = percent(median, 0.1),
+      `vs. national` = ifelse(
+        median - NAT_COLLEGE >= 0,
+        paste0("+", percent(median - NAT_COLLEGE, 0.1)),
+        percent(median - NAT_COLLEGE, 0.1)
+      )
+    ),
+  tibble(Group = "National", N = NA_integer_,
+         `Median BA+` = percent(NAT_COLLEGE, 0.1), `vs. national` = "—")
+) |>
+  kable(align = c("l","r","r","r"), na = "—") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote("BA+ = bachelor's or higher (B15003). National = ACS 5-year 2024.", notation = "none")
+```
+
+<small>*Recently Proposed vs. national (one-sample t): t = `r sprintf("%.2f", t1_edu$statistic)`, p `r ifelse(t1_edu$p.value < 0.001, "< 0.001", sprintf("= %.3f", t1_edu$p.value))`. Recently Proposed vs. Currently Operating (two-sample t): t = `r sprintf("%.2f", t2_edu$statistic)`, p `r ifelse(t2_edu$p.value < 0.001, "< 0.001", sprintf("= %.3f", t2_edu$p.value))`.*</small>
+
+### Income
+
+```{r site-inc-setup}
+dc_inc <- dc_site |> filter(!is.na(income_tract))
+
+inc_sum <- dc_inc |>
+  group_by(grp) |>
+  summarise(
+    n      = n(),
+    median = median(income_tract),
+    .groups = "drop"
+  )
+
+rp_inc    <- dc_inc$income_tract[dc_inc$grp == "Recently\nProposed"]
+op_inc    <- dc_inc$income_tract[dc_inc$grp == "Currently\nOperating"]
+rp_inc_md <- inc_sum$median[inc_sum$grp == "Recently\nProposed"]
+op_inc_md <- inc_sum$median[inc_sum$grp == "Currently\nOperating"]
+t1_inc    <- t.test(rp_inc, mu = NAT_INCOME)
+t2_inc    <- t.test(rp_inc, op_inc)
+rp_inc_ci <- boot_median_ci(rp_inc)
+op_inc_ci <- boot_median_ci(op_inc)
+```
+
+```{r site-inc-density, fig.width=10, fig.height=6, echo=FALSE}
+vl_inc    <- inc_sum |> select(grp, median_val = median)
+ci_inc    <- tibble(grp  = c("Currently\nOperating", "Recently\nProposed"),
+                   xmin = c(op_inc_ci["lo"],         rp_inc_ci["lo"]),
+                   xmax = c(op_inc_ci["hi"],         rp_inc_ci["hi"]))
+
+ggplot(dc_inc, aes(x = income_tract, color = grp, fill = grp)) +
+  geom_rect(data = ci_inc, aes(xmin = xmin, xmax = xmax, fill = grp),
+            ymin = -Inf, ymax = Inf, alpha = 0.15, inherit.aes = FALSE, show.legend = FALSE) +
+  geom_density(alpha = 0.12, linewidth = 0.85) +
+  geom_vline(data = vl_inc, aes(xintercept = median_val, color = grp),
+             linetype = "dashed", linewidth = 0.85) +
+  geom_vline(xintercept = NAT_INCOME, color = "grey30", linetype = "dotted", linewidth = 0.9) +
+  annotate("text", x = NAT_INCOME * 0.82, y = Inf,
+           label = paste0("National\n(", dollar(NAT_INCOME, accuracy = 1), ")"),
+           color = "grey30", vjust = 1.6, hjust = 1, size = 3.0) +
+  geom_text(data = vl_inc, aes(x = median_val, y = Inf,
+            label = dollar(median_val, accuracy = 1), color = grp),
+            vjust = 3.8, hjust = -0.15, size = 3.1, show.legend = FALSE) +
+  scale_x_continuous(labels = label_dollar(), name = "Median income") +
+  scale_color_manual(name = NULL, values = site_colors) +
+  scale_fill_manual(name = NULL, values = site_colors) +
+  labs(title    = "Household Income in Data Center Neighborhoods",
+       caption  = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com.") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "top",
+        axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.title.y = element_blank())
+```
+
+<small>*Dashed lines = group medians; shaded bands = 95% bootstrap CI on the median; dotted line = national average.*</small>
+
+```{r site-inc-table, echo=FALSE}
+bind_rows(
+  inc_sum |>
+    transmute(
+      Group          = str_replace_all(as.character(grp), "\n", " "),
+      N              = n,
+      `Median Income` = dollar(median, accuracy = 1),
+      `vs. national`  = ifelse(
+        median - NAT_INCOME >= 0,
+        paste0("+", dollar(median - NAT_INCOME, accuracy = 1)),
+        dollar(median - NAT_INCOME, accuracy = 1)
+      )
+    ),
+  tibble(Group = "National", N = NA_integer_,
+         `Median Income` = dollar(NAT_INCOME, accuracy = 1), `vs. national` = "—")
+) |>
+  kable(align = c("l","r","r","r"), na = "—") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote("Median of tract-level median HH incomes (B19013). National = ACS 5-year 2024 national median.", notation = "none")
+```
+
+<small>*Recently Proposed vs. national (one-sample t): t = `r sprintf("%.2f", t1_inc$statistic)`, p `r ifelse(t1_inc$p.value < 0.001, "< 0.001", sprintf("= %.3f", t1_inc$p.value))`. Recently Proposed vs. Currently Operating (two-sample t): t = `r sprintf("%.2f", t2_inc$statistic)`, p `r ifelse(t2_inc$p.value < 0.001, "< 0.001", sprintf("= %.3f", t2_inc$p.value))`.*</small>
+
+### Homeownership
+
+```{r site-hom-setup}
+dc_hom <- dc_site |> filter(!is.na(homeowner_tract))
+
+hom_sum <- dc_hom |>
+  group_by(grp) |>
+  summarise(
+    n      = n(),
+    median = median(homeowner_tract),
+    .groups = "drop"
+  )
+
+rp_hom    <- dc_hom$homeowner_tract[dc_hom$grp == "Recently\nProposed"]
+op_hom    <- dc_hom$homeowner_tract[dc_hom$grp == "Currently\nOperating"]
+rp_hom_md <- hom_sum$median[hom_sum$grp == "Recently\nProposed"]
+op_hom_md <- hom_sum$median[hom_sum$grp == "Currently\nOperating"]
+t1_hom    <- t.test(rp_hom, mu = NAT_HOMEOWNER)
+t2_hom    <- t.test(rp_hom, op_hom)
+rp_hom_ci <- boot_median_ci(rp_hom)
+op_hom_ci <- boot_median_ci(op_hom)
+```
+
+```{r site-hom-density, fig.width=10, fig.height=6, echo=FALSE}
+vl_hom    <- hom_sum |>
+  select(grp, median_val = median) |>
+  mutate(hjust_val = if_else(grp == "Currently\nOperating", 1.15, -0.15))
+ci_hom    <- tibble(grp  = c("Currently\nOperating", "Recently\nProposed"),
+                   xmin = c(op_hom_ci["lo"],         rp_hom_ci["lo"]),
+                   xmax = c(op_hom_ci["hi"],         rp_hom_ci["hi"]))
+
+ggplot(dc_hom, aes(x = homeowner_tract, color = grp, fill = grp)) +
+  geom_rect(data = ci_hom, aes(xmin = xmin, xmax = xmax, fill = grp),
+            ymin = -Inf, ymax = Inf, alpha = 0.15, inherit.aes = FALSE, show.legend = FALSE) +
+  geom_density(alpha = 0.12, linewidth = 0.85) +
+  geom_vline(data = vl_hom, aes(xintercept = median_val, color = grp),
+             linetype = "dashed", linewidth = 0.85) +
+  geom_vline(xintercept = NAT_HOMEOWNER, color = "grey30", linetype = "dotted", linewidth = 0.9) +
+  annotate("text", x = NAT_HOMEOWNER + 0.015, y = Inf,
+           label = paste0("National\n(", percent(NAT_HOMEOWNER, 0.1), ")"),
+           color = "grey30", vjust = 1.6, hjust = 0, size = 3.0) +
+  geom_text(data = vl_hom, aes(x = median_val, y = Inf, label = percent(median_val, 0.1), color = grp, hjust = hjust_val),
+            vjust = 3.8, size = 3.1, show.legend = FALSE) +
+  scale_x_continuous(labels = percent_format(1), limits = c(0, 1),
+                     name = "Homeownership rate") +
+  scale_color_manual(name = NULL, values = site_colors) +
+  scale_fill_manual(name = NULL, values = site_colors) +
+  labs(title    = "Homeownership Rate in Data Center Neighborhoods",
+       caption  = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com.") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "top",
+        axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.title.y = element_blank())
+```
+
+<small>*Dashed lines = group medians; shaded bands = 95% bootstrap CI on the median; dotted line = national average.*</small>
+
+```{r site-hom-table, echo=FALSE}
+bind_rows(
+  hom_sum |>
+    transmute(
+      Group                  = str_replace_all(as.character(grp), "\n", " "),
+      N                      = n,
+      `Homeownership rate`    = percent(median, 0.1),
+      `vs. national`         = ifelse(
+        median - NAT_HOMEOWNER >= 0,
+        paste0("+", percent(median - NAT_HOMEOWNER, 0.1)),
+        percent(median - NAT_HOMEOWNER, 0.1)
+      )
+    ),
+  tibble(Group = "National", N = NA_integer_,
+         `Homeownership rate` = percent(NAT_HOMEOWNER, 0.1), `vs. national` = "—")
+) |>
+  kable(align = c("l","r","r","r"), na = "—") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote("Owner-occupied = % of occupied housing units (B25003). National = ACS 5-year 2024.", notation = "none")
+```
+
+<small>*Recently Proposed vs. national (one-sample t): t = `r sprintf("%.2f", t1_hom$statistic)`, p `r ifelse(t1_hom$p.value < 0.001, "< 0.001", sprintf("= %.3f", t1_hom$p.value))`. Recently Proposed vs. Currently Operating (two-sample t): t = `r sprintf("%.2f", t2_hom$statistic)`, p `r ifelse(t2_hom$p.value < 0.001, "< 0.001", sprintf("= %.3f", t2_hom$p.value))`.*</small>
+
+---
+
+## Fighting {.tabset}
+
+### Education (BA+)
+
+```{r fight-edu-setup}
+dc_fight_edu <- dc |>
+  filter(!is.na(pct_college_tract)) |>
+  mutate(quartile = ntile(pct_college_tract, 4))
+
+fight_edu_tbl <- dc_fight_edu |>
+  group_by(quartile) |>
+  summarise(
+    n          = n(),
+    n_resist   = sum(pushback),
+    resist_pct = mean(pushback),
+    edu_min    = min(pct_college_tract),
+    edu_max    = max(pct_college_tract),
+    .groups    = "drop"
+  ) |>
+  mutate(
+    x_label   = factor(
+      paste0(percent(edu_min, 1), "–", percent(edu_max, 1)),
+      levels = paste0(percent(edu_min, 1), "–", percent(edu_max, 1))
+    ),
+    q_label   = factor(
+      c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)"),
+      levels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+    ),
+    bar_label = paste0(percent(resist_pct, 0.1), "\nn = ", n),
+    ci_lo     = map2_dbl(n_resist, n, ~ prop.test(.x, .y, correct = FALSE)$conf.int[1]),
+    ci_hi     = map2_dbl(n_resist, n, ~ prop.test(.x, .y, correct = FALSE)$conf.int[2])
+  )
+
+r_edu_q1       <- fight_edu_tbl$resist_pct[fight_edu_tbl$quartile == 1]
+r_edu_q4       <- fight_edu_tbl$resist_pct[fight_edu_tbl$quartile == 4]
+ratio_edu      <- r_edu_q1 / r_edu_q4
+
+prop_edu_halves <- prop.test(
+  x = c(sum(dc_fight_edu$pushback[dc_fight_edu$quartile %in% c(1, 2)]),
+         sum(dc_fight_edu$pushback[dc_fight_edu$quartile %in% c(3, 4)])),
+  n = c(sum(dc_fight_edu$quartile %in% c(1, 2)),
+         sum(dc_fight_edu$quartile %in% c(3, 4))),
+  correct = FALSE
+)
+```
+
+```{r fight-edu-figure, fig.width=9, fig.height=6, echo=FALSE}
+ggplot(fight_edu_tbl, aes(x = x_label, y = resist_pct)) +
+  geom_col(fill = "#546E7A", width = 0.65) +
+  geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.18, linewidth = 0.7, color = "grey25") +
+  geom_text(aes(y = ci_hi, label = bar_label), vjust = -0.3, size = 3.1, lineheight = 1.1) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.3)),
+    name   = "Share of data centers with community pushback"
+  ) +
+  scale_x_discrete(name = "College-educated (BA+) in census tract") +
+  labs(
+    title   = "Community Pushback Rate by Neighborhood Education",
+    caption = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold"),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+<small>*Error bars = 95% Wilson score confidence intervals on the pushback rate.*</small>
+
+```{r fight-edu-table, echo=FALSE}
+fight_edu_tbl |>
+  transmute(
+    Quartile        = q_label,
+    N               = n,
+    `With pushback` = n_resist,
+    `Pushback rate` = percent(resist_pct, 0.1)
+  ) |>
+  kable(align = c("l", "r", "r", "r")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote("Quartiles calculated for census tracts in analysis. Sources: FracTracker & ACS 5-year 2024, via scienceandpower.substack.com.", notation = "none")
+```
+
+<small>*Bottom half vs. top half (Q1–Q2 vs. Q3–Q4), chi-square test of proportions: χ² = `r sprintf("%.2f", prop_edu_halves$statistic)`, p `r ifelse(prop_edu_halves$p.value < 0.001, "< 0.001", sprintf("= %.3f", prop_edu_halves$p.value))`.*</small>
+
+### Income
+
+```{r fight-inc-setup}
+dc_fight_inc <- dc |>
+  filter(!is.na(income_tract)) |>
+  mutate(quartile = ntile(income_tract, 4))
+
+fight_inc_tbl <- dc_fight_inc |>
+  group_by(quartile) |>
+  summarise(
+    n          = n(),
+    n_resist   = sum(pushback),
+    resist_pct = mean(pushback),
+    inc_min    = min(income_tract),
+    inc_max    = max(income_tract),
+    .groups    = "drop"
+  ) |>
+  mutate(
+    x_label   = factor(
+      paste0("$", round(inc_min / 1e3), "k–$", round(inc_max / 1e3), "k", ifelse(round(inc_max / 1e3) >= 250, "+", "")),
+      levels = paste0("$", round(inc_min / 1e3), "k–$", round(inc_max / 1e3), "k", ifelse(round(inc_max / 1e3) >= 250, "+", ""))
+    ),
+    q_label   = factor(
+      c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)"),
+      levels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+    ),
+    bar_label = paste0(percent(resist_pct, 0.1), "\nn = ", n),
+    ci_lo     = map2_dbl(n_resist, n, ~ prop.test(.x, .y, correct = FALSE)$conf.int[1]),
+    ci_hi     = map2_dbl(n_resist, n, ~ prop.test(.x, .y, correct = FALSE)$conf.int[2])
+  )
+
+r_inc_q1        <- fight_inc_tbl$resist_pct[fight_inc_tbl$quartile == 1]
+r_inc_q4        <- fight_inc_tbl$resist_pct[fight_inc_tbl$quartile == 4]
+ratio_inc       <- r_inc_q1 / r_inc_q4
+
+prop_inc_halves <- prop.test(
+  x = c(sum(dc_fight_inc$pushback[dc_fight_inc$quartile %in% c(1, 2)]),
+         sum(dc_fight_inc$pushback[dc_fight_inc$quartile %in% c(3, 4)])),
+  n = c(sum(dc_fight_inc$quartile %in% c(1, 2)),
+         sum(dc_fight_inc$quartile %in% c(3, 4))),
+  correct = FALSE
+)
+```
+
+```{r fight-inc-figure, fig.width=9, fig.height=6, echo=FALSE}
+ggplot(fight_inc_tbl, aes(x = x_label, y = resist_pct)) +
+  geom_col(fill = "#546E7A", width = 0.65) +
+  geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.18, linewidth = 0.7, color = "grey25") +
+  geom_text(aes(y = ci_hi, label = bar_label), vjust = -0.3, size = 3.1, lineheight = 1.1) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.3)),
+    name   = "Share of data centers with community pushback"
+  ) +
+  scale_x_discrete(name = "Census tract median household income") +
+  labs(
+    title   = "Community Pushback Rate by Neighborhood Income",
+    caption = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold"),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+<small>*Error bars = 95% Wilson score confidence intervals on the pushback rate.*</small>
+
+```{r fight-inc-table, echo=FALSE}
+fight_inc_tbl |>
+  transmute(
+    Quartile        = q_label,
+    N               = n,
+    `With pushback` = n_resist,
+    `Pushback rate` = percent(resist_pct, 0.1)
+  ) |>
+  kable(align = c("l", "r", "r", "r")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote("Quartiles calculated for census tracts in analysis. Sources: FracTracker & ACS 5-year 2024, via scienceandpower.substack.com.", notation = "none")
+```
+
+<small>*Bottom half vs. top half (Q1–Q2 vs. Q3–Q4), chi-square test of proportions: χ² = `r sprintf("%.2f", prop_inc_halves$statistic)`, p `r ifelse(prop_inc_halves$p.value < 0.001, "< 0.001", sprintf("= %.3f", prop_inc_halves$p.value))`.*</small>
+
+### Homeownership
+
+```{r fight-hom-setup}
+dc_fight_hom <- dc |>
+  filter(!is.na(homeowner_tract)) |>
+  mutate(quartile = ntile(homeowner_tract, 4))
+
+fight_hom_tbl <- dc_fight_hom |>
+  group_by(quartile) |>
+  summarise(
+    n          = n(),
+    n_resist   = sum(pushback),
+    resist_pct = mean(pushback),
+    hom_min    = min(homeowner_tract),
+    hom_max    = max(homeowner_tract),
+    .groups    = "drop"
+  ) |>
+  mutate(
+    x_label   = factor(
+      paste0(percent(hom_min, 1), "–", percent(hom_max, 1)),
+      levels = paste0(percent(hom_min, 1), "–", percent(hom_max, 1))
+    ),
+    q_label   = factor(
+      c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)"),
+      levels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+    ),
+    bar_label = paste0(percent(resist_pct, 0.1), "\nn = ", n),
+    ci_lo     = map2_dbl(n_resist, n, ~ prop.test(.x, .y, correct = FALSE)$conf.int[1]),
+    ci_hi     = map2_dbl(n_resist, n, ~ prop.test(.x, .y, correct = FALSE)$conf.int[2])
+  )
+
+r_hom_q1        <- fight_hom_tbl$resist_pct[fight_hom_tbl$quartile == 1]
+r_hom_q4        <- fight_hom_tbl$resist_pct[fight_hom_tbl$quartile == 4]
+ratio_hom       <- r_hom_q1 / r_hom_q4
+
+prop_hom_halves <- prop.test(
+  x = c(sum(dc_fight_hom$pushback[dc_fight_hom$quartile %in% c(1, 2)]),
+         sum(dc_fight_hom$pushback[dc_fight_hom$quartile %in% c(3, 4)])),
+  n = c(sum(dc_fight_hom$quartile %in% c(1, 2)),
+         sum(dc_fight_hom$quartile %in% c(3, 4))),
+  correct = FALSE
+)
+```
+
+```{r fight-hom-figure, fig.width=9, fig.height=6, echo=FALSE}
+ggplot(fight_hom_tbl, aes(x = x_label, y = resist_pct)) +
+  geom_col(fill = "#546E7A", width = 0.65) +
+  geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.18, linewidth = 0.7, color = "grey25") +
+  geom_text(aes(y = ci_hi, label = bar_label), vjust = -0.3, size = 3.1, lineheight = 1.1) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.3)),
+    name   = "Share of data centers with community pushback"
+  ) +
+  scale_x_discrete(name = "Homeownership rate in census tract") +
+  labs(
+    title   = "Community Pushback Rate by Homeownership Rate",
+    caption = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold"),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+<small>*Error bars = 95% Wilson score confidence intervals on the pushback rate.*</small>
+
+```{r fight-hom-table, echo=FALSE}
+fight_hom_tbl |>
+  transmute(
+    Quartile        = q_label,
+    N               = n,
+    `With pushback` = n_resist,
+    `Pushback rate` = percent(resist_pct, 0.1)
+  ) |>
+  kable(align = c("l", "r", "r", "r")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote("Quartiles calculated for census tracts in analysis. Sources: FracTracker & ACS 5-year 2024, via scienceandpower.substack.com.", notation = "none")
+```
+
+<small>*Bottom half vs. top half (Q1–Q2 vs. Q3–Q4), chi-square test of proportions: χ² = `r sprintf("%.2f", prop_hom_halves$statistic)`, p `r ifelse(prop_hom_halves$p.value < 0.001, "< 0.001", sprintf("= %.3f", prop_hom_halves$p.value))`.*</small>
+
+## Fighting: Recently Proposed {.tabset}
+
+### Education (BA+)
+
+```{r rp-fight-edu-setup}
+dc_rp_fight_edu <- dc |>
+  filter(is_recently_proposed, !is.na(pct_college_tract)) |>
+  mutate(quartile = ntile(pct_college_tract, 4))
+
+rp_fight_edu_tbl <- dc_rp_fight_edu |>
+  group_by(quartile) |>
+  summarise(
+    n          = n(),
+    n_resist   = sum(pushback),
+    resist_pct = mean(pushback),
+    edu_min    = min(pct_college_tract),
+    edu_max    = max(pct_college_tract),
+    .groups    = "drop"
+  ) |>
+  mutate(
+    x_label   = factor(
+      paste0(percent(edu_min, 1), "–", percent(edu_max, 1)),
+      levels = paste0(percent(edu_min, 1), "–", percent(edu_max, 1))
+    ),
+    q_label   = factor(
+      c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)"),
+      levels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+    ),
+    bar_label = paste0(percent(resist_pct, 0.1), "\nn = ", n),
+    ci_lo     = map2_dbl(n_resist, n, ~ prop.test(.x, .y, correct = FALSE)$conf.int[1]),
+    ci_hi     = map2_dbl(n_resist, n, ~ prop.test(.x, .y, correct = FALSE)$conf.int[2])
+  )
+
+rp_r_edu_q1       <- rp_fight_edu_tbl$resist_pct[rp_fight_edu_tbl$quartile == 1]
+rp_r_edu_q4       <- rp_fight_edu_tbl$resist_pct[rp_fight_edu_tbl$quartile == 4]
+rp_ratio_edu      <- rp_r_edu_q1 / rp_r_edu_q4
+
+rp_prop_edu_halves <- prop.test(
+  x = c(sum(dc_rp_fight_edu$pushback[dc_rp_fight_edu$quartile %in% c(1, 2)]),
+         sum(dc_rp_fight_edu$pushback[dc_rp_fight_edu$quartile %in% c(3, 4)])),
+  n = c(sum(dc_rp_fight_edu$quartile %in% c(1, 2)),
+         sum(dc_rp_fight_edu$quartile %in% c(3, 4))),
+  correct = FALSE
+)
+```
+
+```{r rp-fight-edu-figure, fig.width=9, fig.height=6, echo=FALSE}
+ggplot(rp_fight_edu_tbl, aes(x = x_label, y = resist_pct)) +
+  geom_col(fill = "#546E7A", width = 0.65) +
+  geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.18, linewidth = 0.7, color = "grey25") +
+  geom_text(aes(y = ci_hi, label = bar_label), vjust = -0.3, size = 3.1, lineheight = 1.1) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.3)),
+    name   = "Share of data centers with community pushback"
+  ) +
+  scale_x_discrete(name = "College-educated (BA+) in census tract") +
+  labs(
+    title   = "Community Pushback Rate by Neighborhood Education",
+    caption = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold"),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+<small>*Error bars = 95% Wilson score confidence intervals on the pushback rate.*</small>
+
+```{r rp-fight-edu-table, echo=FALSE}
+rp_fight_edu_tbl |>
+  transmute(
+    Quartile        = q_label,
+    N               = n,
+    `With pushback` = n_resist,
+    `Pushback rate` = percent(resist_pct, 0.1)
+  ) |>
+  kable(align = c("l", "r", "r", "r")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote("Quartiles calculated within the displayed group. Sources: FracTracker & ACS 5-year 2024, via scienceandpower.substack.com.", notation = "none")
+```
+
+<small>*Bottom half vs. top half (Q1–Q2 vs. Q3–Q4), chi-square test of proportions: χ² = `r sprintf("%.2f", rp_prop_edu_halves$statistic)`, p `r ifelse(rp_prop_edu_halves$p.value < 0.001, "< 0.001", sprintf("= %.3f", rp_prop_edu_halves$p.value))`.*</small>
+
+### Income
+
+```{r rp-fight-inc-setup}
+dc_rp_fight_inc <- dc |>
+  filter(is_recently_proposed, !is.na(income_tract)) |>
+  mutate(quartile = ntile(income_tract, 4))
+
+rp_fight_inc_tbl <- dc_rp_fight_inc |>
+  group_by(quartile) |>
+  summarise(
+    n          = n(),
+    n_resist   = sum(pushback),
+    resist_pct = mean(pushback),
+    inc_min    = min(income_tract),
+    inc_max    = max(income_tract),
+    .groups    = "drop"
+  ) |>
+  mutate(
+    x_label   = factor(
+      paste0("$", round(inc_min / 1e3), "k–$", round(inc_max / 1e3), "k", ifelse(round(inc_max / 1e3) >= 250, "+", "")),
+      levels = paste0("$", round(inc_min / 1e3), "k–$", round(inc_max / 1e3), "k", ifelse(round(inc_max / 1e3) >= 250, "+", ""))
+    ),
+    q_label   = factor(
+      c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)"),
+      levels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+    ),
+    bar_label = paste0(percent(resist_pct, 0.1), "\nn = ", n),
+    ci_lo     = map2_dbl(n_resist, n, ~ prop.test(.x, .y, correct = FALSE)$conf.int[1]),
+    ci_hi     = map2_dbl(n_resist, n, ~ prop.test(.x, .y, correct = FALSE)$conf.int[2])
+  )
+
+rp_r_inc_q1        <- rp_fight_inc_tbl$resist_pct[rp_fight_inc_tbl$quartile == 1]
+rp_r_inc_q4        <- rp_fight_inc_tbl$resist_pct[rp_fight_inc_tbl$quartile == 4]
+rp_ratio_inc       <- rp_r_inc_q1 / rp_r_inc_q4
+
+rp_prop_inc_halves <- prop.test(
+  x = c(sum(dc_rp_fight_inc$pushback[dc_rp_fight_inc$quartile %in% c(1, 2)]),
+         sum(dc_rp_fight_inc$pushback[dc_rp_fight_inc$quartile %in% c(3, 4)])),
+  n = c(sum(dc_rp_fight_inc$quartile %in% c(1, 2)),
+         sum(dc_rp_fight_inc$quartile %in% c(3, 4))),
+  correct = FALSE
+)
+```
+
+```{r rp-fight-inc-figure, fig.width=9, fig.height=6, echo=FALSE}
+ggplot(rp_fight_inc_tbl, aes(x = x_label, y = resist_pct)) +
+  geom_col(fill = "#546E7A", width = 0.65) +
+  geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.18, linewidth = 0.7, color = "grey25") +
+  geom_text(aes(y = ci_hi, label = bar_label), vjust = -0.3, size = 3.1, lineheight = 1.1) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.3)),
+    name   = "Share of data centers with community pushback"
+  ) +
+  scale_x_discrete(name = "Census tract median household income") +
+  labs(
+    title   = "Community Pushback Rate by Neighborhood Income",
+    caption = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold"),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+<small>*Error bars = 95% Wilson score confidence intervals on the pushback rate.*</small>
+
+```{r rp-fight-inc-table, echo=FALSE}
+rp_fight_inc_tbl |>
+  transmute(
+    Quartile        = q_label,
+    N               = n,
+    `With pushback` = n_resist,
+    `Pushback rate` = percent(resist_pct, 0.1)
+  ) |>
+  kable(align = c("l", "r", "r", "r")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote("Quartiles calculated within the displayed group. Sources: FracTracker & ACS 5-year 2024, via scienceandpower.substack.com.", notation = "none")
+```
+
+<small>*Bottom half vs. top half (Q1–Q2 vs. Q3–Q4), chi-square test of proportions: χ² = `r sprintf("%.2f", rp_prop_inc_halves$statistic)`, p `r ifelse(rp_prop_inc_halves$p.value < 0.001, "< 0.001", sprintf("= %.3f", rp_prop_inc_halves$p.value))`.*</small>
+
+### Homeownership
+
+```{r rp-fight-hom-setup}
+dc_rp_fight_hom <- dc |>
+  filter(is_recently_proposed, !is.na(homeowner_tract)) |>
+  mutate(quartile = ntile(homeowner_tract, 4))
+
+rp_fight_hom_tbl <- dc_rp_fight_hom |>
+  group_by(quartile) |>
+  summarise(
+    n          = n(),
+    n_resist   = sum(pushback),
+    resist_pct = mean(pushback),
+    hom_min    = min(homeowner_tract),
+    hom_max    = max(homeowner_tract),
+    .groups    = "drop"
+  ) |>
+  mutate(
+    x_label   = factor(
+      paste0(percent(hom_min, 1), "–", percent(hom_max, 1)),
+      levels = paste0(percent(hom_min, 1), "–", percent(hom_max, 1))
+    ),
+    q_label   = factor(
+      c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)"),
+      levels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+    ),
+    bar_label = paste0(percent(resist_pct, 0.1), "\nn = ", n),
+    ci_lo     = map2_dbl(n_resist, n, ~ prop.test(.x, .y, correct = FALSE)$conf.int[1]),
+    ci_hi     = map2_dbl(n_resist, n, ~ prop.test(.x, .y, correct = FALSE)$conf.int[2])
+  )
+
+rp_r_hom_q1        <- rp_fight_hom_tbl$resist_pct[rp_fight_hom_tbl$quartile == 1]
+rp_r_hom_q4        <- rp_fight_hom_tbl$resist_pct[rp_fight_hom_tbl$quartile == 4]
+rp_ratio_hom       <- rp_r_hom_q1 / rp_r_hom_q4
+
+rp_prop_hom_halves <- prop.test(
+  x = c(sum(dc_rp_fight_hom$pushback[dc_rp_fight_hom$quartile %in% c(1, 2)]),
+         sum(dc_rp_fight_hom$pushback[dc_rp_fight_hom$quartile %in% c(3, 4)])),
+  n = c(sum(dc_rp_fight_hom$quartile %in% c(1, 2)),
+         sum(dc_rp_fight_hom$quartile %in% c(3, 4))),
+  correct = FALSE
+)
+```
+
+```{r rp-fight-hom-figure, fig.width=9, fig.height=6, echo=FALSE}
+ggplot(rp_fight_hom_tbl, aes(x = x_label, y = resist_pct)) +
+  geom_col(fill = "#546E7A", width = 0.65) +
+  geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.18, linewidth = 0.7, color = "grey25") +
+  geom_text(aes(y = ci_hi, label = bar_label), vjust = -0.3, size = 3.1, lineheight = 1.1) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.3)),
+    name   = "Share of data centers with community pushback"
+  ) +
+  scale_x_discrete(name = "Homeownership rate in census tract") +
+  labs(
+    title   = "Community Pushback Rate by Homeownership Rate",
+    caption = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold"),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+<small>*Error bars = 95% Wilson score confidence intervals on the pushback rate.*</small>
+
+```{r rp-fight-hom-table, echo=FALSE}
+rp_fight_hom_tbl |>
+  transmute(
+    Quartile        = q_label,
+    N               = n,
+    `With pushback` = n_resist,
+    `Pushback rate` = percent(resist_pct, 0.1)
+  ) |>
+  kable(align = c("l", "r", "r", "r")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote("Quartiles calculated within the displayed group. Sources: FracTracker & ACS 5-year 2024, via scienceandpower.substack.com.", notation = "none")
+```
+
+<small>*Bottom half vs. top half (Q1–Q2 vs. Q3–Q4), chi-square test of proportions: χ² = `r sprintf("%.2f", rp_prop_hom_halves$statistic)`, p `r ifelse(rp_prop_hom_halves$p.value < 0.001, "< 0.001", sprintf("= %.3f", rp_prop_hom_halves$p.value))`.*</small>
+
+## Modeling {.tabset}
+
+Logistic regression predicting **community pushback** (Yes vs. No) across all data centers with complete data on all three predictors. Predictors are z-scored (centered, scaled to SD = 1) so odds ratios reflect a one-standard-deviation increase in each neighborhood characteristic.
+
+### Forest plot
+
+```{r reg-setup}
+dc_reg <- dc |>
+  filter(!is.na(pushback),
+         !is.na(pct_college_tract),
+         !is.na(income_tract),
+
+         !is.na(homeowner_tract)) |>
+  mutate(
+    pushback_int = as.integer(pushback),
+    college_z    = as.numeric(scale(pct_college_tract)),
+    income_z     = as.numeric(scale(income_tract)),
+
+    homeowner_z  = as.numeric(scale(homeowner_tract))
+  )
+
+pred_vars <- c("college_z", "income_z", "homeowner_z")
+pred_labels <- c(
+  college_z   = "College-educated (BA+)",
+  income_z    = "Median household income",
+  homeowner_z = "Homeownership rate"
+)
+
+m_full <- glm(pushback_int ~ college_z + income_z + homeowner_z,
+              data = dc_reg, family = binomial)
+```
+
+Sample: **n=`r nrow(dc_reg)`** data centers (`r sum(dc_reg$pushback_int)` with pushback, `r sum(dc_reg$pushback_int == 0)` without). All status groups included.
+
+```{r reg-forest, fig.width = 11, fig.height = 5, echo = FALSE}
+or_singles <- map_dfr(pred_vars, function(v) {
+  m <- glm(as.formula(paste("pushback_int ~", v)), data = dc_reg, family = binomial)
+  tidy(m, exponentiate = TRUE, conf.int = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(panel = "Single-predictor models")
+})
+
+or_full <- tidy(m_full, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(panel = "Full model (all three predictors)")
+
+or_all <- bind_rows(or_singles, or_full) |>
+  mutate(
+    term_clean = pred_labels[term],
+    term_clean = factor(term_clean, levels = rev(pred_labels)),
+    sig        = p.value < 0.05,
+    panel      = factor(panel, levels = c("Single-predictor models", "Full model (all three predictors)"))
+  )
+
+ggplot(or_all, aes(x = estimate, y = term_clean, color = sig)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey30", linewidth = 0.8) +
+  geom_linerange(aes(xmin = conf.low, xmax = conf.high), linewidth = 2.5, alpha = 0.4) +
+  geom_point(size = 3.5) +
+  facet_wrap(~panel, ncol = 2, scales = "free_x") +
+  scale_color_manual(values = c("FALSE" = "grey55", "TRUE" = "#C62828"),
+                     labels = c("Not significant (p≥0.05)", "Significant (p<0.05)")) +
+  scale_x_log10(labels = label_number(accuracy = 0.1)) +
+  labs(title = "Predicting community pushback",
+       x = "Odds ratio (log scale)", y = NULL, color = NULL,
+       caption = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com.") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title  = element_text(face = "bold"),
+        legend.position = "bottom",
+        strip.text  = element_text(face = "bold", size = 11),
+        panel.spacing = unit(1.5, "lines"))
+```
+
+### Full model
+
+```{r reg-table, echo = FALSE}
+tidy(m_full, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    Predictor = pred_labels[term],
+    OR        = round(estimate, 3),
+    `95% CI`  = paste0("[", round(conf.low, 3), ", ", round(conf.high, 3), "]"),
+    p         = ifelse(p.value < 0.001, "< 0.001", sprintf("%.3f", p.value)),
+    Sig       = ifelse(p.value < 0.05, "✓", "")
+  ) |>
+  select(Predictor, OR, `95% CI`, p, Sig) |>
+  kable(align = c("l", "r", "r", "r", "c")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote(
+    paste0("Outcome = community pushback (Yes vs. No). All status groups. n = ",
+           nrow(dc_reg), ". Model AIC = ", round(AIC(m_full), 1), "."),
+    notation = "none"
+  )
+```
+
+```{r reg-prose, echo = FALSE, results = 'asis'}
+full_tidy <- tidy(m_full, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(term_clean = pred_labels[term])
+sig_terms  <- full_tidy |> filter(p.value < 0.05)  |> pull(term_clean)
+nsig_terms <- full_tidy |> filter(p.value >= 0.05) |> pull(term_clean)
+cat(sprintf(
+  "\n> **Full model:** Significant predictors: **%s**. Non-significant: %s. AIC = %.1f.\n\n",
+  if (length(sig_terms)  == 0) "none" else paste(sig_terms,  collapse = ", "),
+  if (length(nsig_terms) == 0) "none" else paste(nsig_terms, collapse = ", "),
+  AIC(m_full)
+))
+```
+
+## Modeling: Recently Proposed {.tabset}
+
+Logistic regression predicting **community pushback** (Yes vs. No), restricted to **Recently Proposed** data centers.
+
+### Forest plot
+
+```{r rp-reg-setup}
+dc_reg_rp <- dc |>
+  filter(is_recently_proposed,
+         !is.na(pushback),
+         !is.na(pct_college_tract),
+         !is.na(income_tract),
+
+         !is.na(homeowner_tract)) |>
+  mutate(
+    pushback_int = as.integer(pushback),
+    college_z    = as.numeric(scale(pct_college_tract)),
+    income_z     = as.numeric(scale(income_tract)),
+
+    homeowner_z  = as.numeric(scale(homeowner_tract))
+  )
+
+m_full_rp <- glm(pushback_int ~ college_z + income_z + homeowner_z,
+                 data = dc_reg_rp, family = binomial)
+```
+
+Sample: **n=`r nrow(dc_reg_rp)`** Recently Proposed data centers (`r sum(dc_reg_rp$pushback_int)` with pushback, `r sum(dc_reg_rp$pushback_int == 0)` without).
+
+```{r rp-reg-forest, fig.width = 11, fig.height = 5, echo = FALSE}
+rp_or_singles <- map_dfr(pred_vars, function(v) {
+  m <- glm(as.formula(paste("pushback_int ~", v)), data = dc_reg_rp, family = binomial)
+  tidy(m, exponentiate = TRUE, conf.int = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(panel = "Single-predictor models")
+})
+
+rp_or_full <- tidy(m_full_rp, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(panel = "Full model (all three predictors)")
+
+rp_or_all <- bind_rows(rp_or_singles, rp_or_full) |>
+  mutate(
+    term_clean = pred_labels[term],
+    term_clean = factor(term_clean, levels = rev(pred_labels)),
+    sig        = p.value < 0.05,
+    panel      = factor(panel, levels = c("Single-predictor models", "Full model (all three predictors)"))
+  )
+
+ggplot(rp_or_all, aes(x = estimate, y = term_clean, color = sig)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey30", linewidth = 0.8) +
+  geom_linerange(aes(xmin = conf.low, xmax = conf.high), linewidth = 2.5, alpha = 0.4) +
+  geom_point(size = 3.5) +
+  facet_wrap(~panel, ncol = 2, scales = "free_x") +
+  scale_color_manual(values = c("FALSE" = "grey55", "TRUE" = "#C62828"),
+                     labels = c("Not significant (p≥0.05)", "Significant (p<0.05)")) +
+  scale_x_log10(labels = label_number(accuracy = 0.1)) +
+  labs(title = "Predicting community pushback (Recently Proposed only)",
+       x = "Odds ratio (log scale)", y = NULL, color = NULL,
+       caption = "Sources: FracTracker & ACS 5-year 2024 (2020\u20132024), via scienceandpower.substack.com.") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title  = element_text(face = "bold"),
+        legend.position = "bottom",
+        strip.text  = element_text(face = "bold", size = 11),
+        panel.spacing = unit(1.5, "lines"))
+```
+
+### Full model
+
+```{r rp-reg-table, echo = FALSE}
+tidy(m_full_rp, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    Predictor = pred_labels[term],
+    OR        = round(estimate, 3),
+    `95% CI`  = paste0("[", round(conf.low, 3), ", ", round(conf.high, 3), "]"),
+    p         = ifelse(p.value < 0.001, "< 0.001", sprintf("%.3f", p.value)),
+    Sig       = ifelse(p.value < 0.05, "\u2713", "")
+  ) |>
+  select(Predictor, OR, `95% CI`, p, Sig) |>
+  kable(align = c("l", "r", "r", "r", "c")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote(
+    paste0("Outcome = community pushback (Yes vs. No). Recently Proposed sites only. n = ",
+           nrow(dc_reg_rp), ". Model AIC = ", round(AIC(m_full_rp), 1), "."),
+    notation = "none"
+  )
+```
+
+```{r rp-reg-prose, echo = FALSE, results = 'asis'}
+rp_full_tidy <- tidy(m_full_rp, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(term_clean = pred_labels[term])
+rp_sig_terms  <- rp_full_tidy |> filter(p.value < 0.05)  |> pull(term_clean)
+rp_nsig_terms <- rp_full_tidy |> filter(p.value >= 0.05) |> pull(term_clean)
+cat(sprintf(
+  "\n> **Full model (Recently Proposed):** Significant predictors: **%s**. Non-significant: %s. AIC = %.1f.\n\n",
+  if (length(rp_sig_terms)  == 0) "none" else paste(rp_sig_terms,  collapse = ", "),
+  if (length(rp_nsig_terms) == 0) "none" else paste(rp_nsig_terms, collapse = ", "),
+  AIC(m_full_rp)
+))
+```
+
+## Spiking {.tabset}
+
+Logistic regression predicting **cancellation or suspension** (Cancelled/Suspended = 1 vs. Pending = 0) among Recently Proposed data centers. Two models: demographics alone, then demographics plus community pushback.
+
+### Modeling
+
+```{r spike-setup}
+dc_spike <- dc |>
+  filter(is_recently_proposed,
+         !is.na(pct_college_tract),
+         !is.na(income_tract),
+
+         !is.na(homeowner_tract)) |>
+  mutate(
+    cancelled_int = as.integer(is_cancelled),
+    college_z     = as.numeric(scale(pct_college_tract)),
+    income_z      = as.numeric(scale(income_tract)),
+    homeowner_z   = as.numeric(scale(homeowner_tract))
+  )
+
+m_spike <- glm(cancelled_int ~ college_z + income_z + homeowner_z,
+               data = dc_spike, family = binomial)
+```
+
+Sample: **n=`r nrow(dc_spike)`** Recently Proposed data centers (`r sum(dc_spike$cancelled_int)` cancelled/suspended, `r sum(dc_spike$cancelled_int == 0)` pending).
+
+```{r spike-forest, fig.width = 11, fig.height = 5, echo = FALSE}
+spike_or_singles <- map_dfr(pred_vars, function(v) {
+  m <- glm(as.formula(paste("cancelled_int ~", v)), data = dc_spike, family = binomial)
+  tidy(m, exponentiate = TRUE, conf.int = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(panel = "Single-predictor models")
+})
+
+spike_or_full <- tidy(m_spike, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(panel = "Full model (all three predictors)")
+
+spike_or_all <- bind_rows(spike_or_singles, spike_or_full) |>
+  mutate(
+    term_clean = pred_labels[term],
+    term_clean = factor(term_clean, levels = rev(pred_labels)),
+    sig        = p.value < 0.05,
+    panel      = factor(panel, levels = c("Single-predictor models", "Full model (all three predictors)"))
+  )
+
+ggplot(spike_or_all, aes(x = estimate, y = term_clean, color = sig)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey30", linewidth = 0.8) +
+  geom_linerange(aes(xmin = conf.low, xmax = conf.high), linewidth = 2.5, alpha = 0.4) +
+  geom_point(size = 3.5) +
+  facet_wrap(~panel, ncol = 2, scales = "free_x") +
+  scale_color_manual(values = c("FALSE" = "grey55", "TRUE" = "#C62828"),
+                     labels = c("Not significant (p≥0.05)", "Significant (p<0.05)")) +
+  scale_x_log10(labels = label_number(accuracy = 0.1)) +
+  labs(title = "Predicting cancellation w/ demographics",
+       x = "Odds ratio (log scale)", y = NULL, color = NULL,
+       caption = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com.") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold"),
+        legend.position  = "bottom",
+        strip.text       = element_text(face = "bold", size = 11),
+        panel.spacing    = unit(1.5, "lines"))
+```
+
+```{r spike-table, echo = FALSE}
+tidy(m_spike, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    Predictor = pred_labels[term],
+    OR        = round(estimate, 3),
+    `95% CI`  = paste0("[", round(conf.low, 3), ", ", round(conf.high, 3), "]"),
+    p         = ifelse(p.value < 0.001, "< 0.001", sprintf("%.3f", p.value)),
+    Sig       = ifelse(p.value < 0.05, "✓", "")
+  ) |>
+  select(Predictor, OR, `95% CI`, p, Sig) |>
+  kable(align = c("l", "r", "r", "r", "c")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote(
+    paste0("Outcome = Cancelled/Suspended vs. Pending. Recently Proposed sites only. n = ",
+           nrow(dc_spike), ". Model AIC = ", round(AIC(m_spike), 1), "."),
+    notation = "none"
+  )
+```
+
+### Pushback sites only
+
+```{r spike-pb-only-setup}
+pb_vars   <- c("college_z", "income_z", "homeowner_z")
+pb_labels <- c(college_z = "College-educated (BA+)", income_z = "Median household income", homeowner_z = "Homeownership rate")
+
+dc_pb_only <- dc |>
+  filter(is_recently_proposed, pushback,
+         !is.na(pct_college_tract),
+         !is.na(income_tract),
+         !is.na(homeowner_tract)) |>
+  mutate(
+    cancelled_int = as.integer(is_cancelled),
+    college_z     = as.numeric(scale(pct_college_tract)),
+    income_z      = as.numeric(scale(income_tract)),
+    homeowner_z   = as.numeric(scale(homeowner_tract))
+  )
+
+m_pb_only <- glm(cancelled_int ~ college_z + income_z + homeowner_z,
+                 data = dc_pb_only, family = binomial)
+```
+
+Among the **n=`r nrow(dc_pb_only)`** Recently Proposed sites with documented community pushback (`r sum(dc_pb_only$cancelled_int)` cancelled/suspended, `r sum(dc_pb_only$cancelled_int == 0)` pending): do neighborhood demographics predict which of those contested sites end up cancelled?
+
+```{r spike-pb-only-forest, fig.width = 11, fig.height = 4.5, echo = FALSE}
+pb_only_singles <- map_dfr(pb_vars, function(v) {
+  m <- glm(as.formula(paste("cancelled_int ~", v)), data = dc_pb_only, family = binomial)
+  tidy(m, exponentiate = TRUE, conf.int = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(panel = "Single-predictor models")
+})
+
+pb_only_full <- tidy(m_pb_only, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(panel = "Full model (BA+, income, homeownership)")
+
+pb_only_all <- bind_rows(pb_only_singles, pb_only_full) |>
+  mutate(
+    term_clean = pb_labels[term],
+    term_clean = factor(term_clean, levels = rev(pb_labels)),
+    sig        = p.value < 0.05,
+    panel      = factor(panel, levels = c("Single-predictor models", "Full model (BA+, income, homeownership)"))
+  )
+
+ggplot(pb_only_all, aes(x = estimate, y = term_clean, color = sig)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey30", linewidth = 0.8) +
+  geom_linerange(aes(xmin = conf.low, xmax = conf.high), linewidth = 2.5, alpha = 0.4) +
+  geom_point(size = 3.5) +
+  facet_wrap(~panel, ncol = 2, scales = "free_x") +
+  scale_color_manual(values = c("FALSE" = "grey55", "TRUE" = "#C62828"),
+                     labels = c("Not significant (p≥0.05)", "Significant (p<0.05)")) +
+  scale_x_log10(labels = label_number(accuracy = 0.1)) +
+  labs(title = "Predicting cancellation where there's pushback",
+       x = "Odds ratio (log scale)", y = NULL, color = NULL,
+       caption = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com.") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold"),
+        legend.position  = "bottom",
+        strip.text       = element_text(face = "bold", size = 11),
+        panel.spacing    = unit(1.5, "lines"))
+```
+
+```{r spike-pb-only-table, echo = FALSE}
+tidy(m_pb_only, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    Predictor = pb_labels[term],
+    OR        = round(estimate, 3),
+    `95% CI`  = paste0("[", round(conf.low, 3), ", ", round(conf.high, 3), "]"),
+    p         = ifelse(p.value < 0.001, "< 0.001", sprintf("%.3f", p.value)),
+    Sig       = ifelse(p.value < 0.05, "✓", "")
+  ) |>
+  select(Predictor, OR, `95% CI`, p, Sig) |>
+  kable(align = c("l", "r", "r", "r", "c")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote(
+    paste0("Outcome = Cancelled/Suspended vs. Pending. Recently Proposed sites with pushback only. n = ",
+           nrow(dc_pb_only), ". Model AIC = ", round(AIC(m_pb_only), 1), "."),
+    notation = "none"
+  )
+```
+
+## Summary
+
+Demographic profile of data centers by status group. The primary comparison is **Cancelled/Suspended vs. Pending** (both Recently Proposed); Currently Operating is included as a reference baseline. Difference row and p-values reflect Cancelled/Suspended minus Pending.
+
+```{r summary-tables, echo=FALSE}
+grp_op  <- dc |> filter(is_operating)
+grp_rp  <- dc |> filter(is_recently_proposed)
+grp_pen <- dc |> filter(is_pending)
+grp_can <- dc |> filter(is_cancelled)
+
+med <- function(x) median(x, na.rm = TRUE)
+
+grp_stats <- function(g) list(
+  n   = nrow(g),
+  inc = med(g$income_tract),
+  col = med(g$pct_college_tract),
+  hom = med(g$homeowner_tract),
+  pb  = mean(g$pushback, na.rm = TRUE)
+)
+
+s_op  <- grp_stats(grp_op)
+s_rp  <- grp_stats(grp_rp)
+s_pen <- grp_stats(grp_pen)
+s_can <- grp_stats(grp_can)
+
+fmt_p   <- function(p) ifelse(p < 0.001, "< 0.001", sprintf("%.3f", p))
+fmt_d_d <- function(x) paste0(ifelse(x >= 0, "+", ""), dollar(round(x)))
+fmt_d_p <- function(x) paste0(ifelse(x >= 0, "+", ""), sprintf("%.1f pp", x * 100))
+
+make_row <- function(label, s) {
+  tibble(
+    Group               = label,
+    N                   = as.character(s$n),
+    `Median income`     = dollar(round(s$inc)),
+    `College-educated`  = percent(s$col, 0.1),
+    Homeownership       = percent(s$hom, 0.1),
+    `With pushback`     = percent(s$pb,  0.1)
+  )
+}
+
+make_diff_row <- function(a, b) {
+  tibble(
+    Group               = "Difference",
+    N                   = "—",
+    `Median income`     = fmt_d_d(b$inc - a$inc),
+    `College-educated`  = fmt_d_p(b$col - a$col),
+    Homeownership       = fmt_d_p(b$hom - a$hom),
+    `With pushback`     = fmt_d_p(b$pb  - a$pb)
+  )
+}
+
+make_pval_row <- function(ga, gb) {
+  tibble(
+    Group               = "p-value",
+    N                   = "—",
+    `Median income`     = fmt_p(t.test(gb$income_tract,      ga$income_tract)$p.value),
+    `College-educated`  = fmt_p(t.test(gb$pct_college_tract, ga$pct_college_tract)$p.value),
+
+    Homeownership       = fmt_p(t.test(gb$homeowner_tract,   ga$homeowner_tract)$p.value),
+    `With pushback`     = fmt_p(prop.test(
+      x = c(sum(gb$pushback, na.rm = TRUE), sum(ga$pushback, na.rm = TRUE)),
+      n = c(sum(!is.na(gb$pushback)),        sum(!is.na(ga$pushback))),
+      correct = FALSE)$p.value)
+  )
+}
+
+tbl1 <- bind_rows(
+  make_row("Currently Operating", s_op),
+  make_row("Recently Proposed",   s_rp),
+  make_diff_row(s_op, s_rp),
+  make_pval_row(grp_op, grp_rp)
+)
+
+tbl2 <- bind_rows(
+  make_row("Pending",             s_pen),
+  make_row("Cancelled/Suspended", s_can),
+  make_diff_row(s_pen, s_can),
+  make_pval_row(grp_pen, grp_can)
+)
+
+fn_note <- paste0(
+  "Medians reported for all variables. ",
+  "Difference = row 2 minus row 1. ",
+  "P-values: two-sample t-test (income, education, homeownership); ",
+  "chi-square test of proportions (pushback). ",
+  "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com."
+)
+
+tbl1 |>
+  kable(align = c("l", "r", "r", "r", "r", "r"),
+        caption = "Operating vs. Recently Proposed") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote(fn_note, notation = "none")
+
+tbl2 |>
+  kable(align = c("l", "r", "r", "r", "r", "r"),
+        caption = "Pending vs. Cancelled/Suspended") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote(fn_note, notation = "none")
+```
+
+### Modeling: With Pushback
+
+```{r spike-pb-setup}
+dc_spike_pb <- dc_spike |>
+  filter(!is.na(pushback)) |>
+  mutate(pushback_int = as.integer(pushback))
+
+m_spike_pb <- glm(cancelled_int ~ college_z + income_z + homeowner_z + pushback_int,
+                  data = dc_spike_pb, family = binomial)
+```
+
+Sample: **n=`r nrow(dc_spike_pb)`** Recently Proposed data centers with complete pushback data (`r sum(dc_spike_pb$cancelled_int)` cancelled/suspended, `r sum(dc_spike_pb$cancelled_int == 0)` pending).
+
+```{r spike-pb-forest, fig.width = 11, fig.height = 5.5, echo = FALSE}
+pred_vars_pb  <- c(pred_vars, "pushback_int")
+pred_labels_pb <- c(pred_labels, pushback_int = "Community pushback")
+
+spike_pb_singles <- map_dfr(pred_vars_pb, function(v) {
+  m <- glm(as.formula(paste("cancelled_int ~", v)), data = dc_spike_pb, family = binomial)
+  tidy(m, exponentiate = TRUE, conf.int = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(panel = "Single-predictor models")
+})
+
+spike_pb_full <- tidy(m_spike_pb, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(panel = "Full model (demographics + pushback)")
+
+spike_pb_all <- bind_rows(spike_pb_singles, spike_pb_full) |>
+  mutate(
+    term_clean = pred_labels_pb[term],
+    term_clean = factor(term_clean, levels = rev(pred_labels_pb)),
+    sig        = p.value < 0.05,
+    panel      = factor(panel, levels = c("Single-predictor models", "Full model (demographics + pushback)"))
+  )
+
+ggplot(spike_pb_all, aes(x = estimate, y = term_clean, color = sig)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey30", linewidth = 0.8) +
+  geom_linerange(aes(xmin = conf.low, xmax = conf.high), linewidth = 2.5, alpha = 0.4) +
+  geom_point(size = 3.5) +
+  facet_wrap(~panel, ncol = 2, scales = "free_x") +
+  scale_color_manual(values = c("FALSE" = "grey55", "TRUE" = "#C62828"),
+                     labels = c("Not significant (p≥0.05)", "Significant (p<0.05)")) +
+  scale_x_log10(labels = label_number(accuracy = 0.1)) +
+  labs(title = "Predicting cancellation w/ demographics and pushback",
+       x = "Odds ratio (log scale)", y = NULL, color = NULL,
+       caption = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com.") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold"),
+        legend.position  = "bottom",
+        strip.text       = element_text(face = "bold", size = 11),
+        panel.spacing    = unit(1.5, "lines"))
+```
+
+```{r spike-pb-table, echo = FALSE}
+tidy(m_spike_pb, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    Predictor = pred_labels_pb[term],
+    OR        = round(estimate, 3),
+    `95% CI`  = paste0("[", round(conf.low, 3), ", ", round(conf.high, 3), "]"),
+    p         = ifelse(p.value < 0.001, "< 0.001", sprintf("%.3f", p.value)),
+    Sig       = ifelse(p.value < 0.05, "✓", "")
+  ) |>
+  select(Predictor, OR, `95% CI`, p, Sig) |>
+  kable(align = c("l", "r", "r", "r", "c")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote(
+    paste0("Outcome = Cancelled/Suspended vs. Pending. Recently Proposed sites only. n = ",
+           nrow(dc_spike_pb), ". Model AIC = ", round(AIC(m_spike_pb), 1), "."),
+    notation = "none"
+  )
+```
+
+## Bonus {.tabset}
+
+Predicting **cancellation or suspension** (Cancelled/Suspended vs. Pending) among Recently Proposed data centers, using an expanded predictor set: income, education (college+, less-than-HS), urban share, homeownership, industry composition (knowledge economy, industrial), occupation composition (management/professional, production), and community pushback. All continuous predictors are z-scored; pushback is binary.
+
+### Forest plot
+
+```{r bonus-setup}
+BONUS_PRED_ORDER <- c("income_z","college_z","lths_z",
+                      "urban_z","homeowner_z",
+                      "knowledge_z","industrial_z",
+                      "occ_mgmt_z","occ_prod_z",
+                      "pushback_int")
+
+bonus_labels <- c(
+  income_z     = "Income (z)",
+  college_z    = "College+ (z)",
+  lths_z       = "Less-than-HS (z)",
+  urban_z      = "Urban share (z)",
+  homeowner_z  = "Homeownership (z)",
+  knowledge_z  = "Knowledge econ. (z)",
+  industrial_z = "Industrial (z)",
+  occ_mgmt_z   = "Occ: Mgmt/Prof (z)",
+  occ_prod_z   = "Occ: Production (z)",
+  pushback_int = "Community pushback"
+)
+
+dc_bonus <- dc |>
+  filter(is_recently_proposed,
+         !is.na(pct_college_tract), !is.na(income_tract),
+         !is.na(homeowner_tract),
+         !is.na(pct_lths),          !is.na(pct_urban),
+         !is.na(pct_knowledge)) |>
+  mutate(
+    cancelled_int = as.integer(is_cancelled),
+    pushback_int  = as.integer(pushback),
+    income_z      = as.numeric(scale(income_tract)),
+    college_z     = as.numeric(scale(pct_college_tract)),
+    lths_z        = as.numeric(scale(pct_lths)),
+    urban_z       = as.numeric(scale(pct_urban)),
+    homeowner_z   = as.numeric(scale(homeowner_tract)),
+    knowledge_z   = as.numeric(scale(pct_knowledge)),
+    industrial_z  = as.numeric(scale(pct_industrial)),
+    occ_mgmt_z    = as.numeric(scale(pct_occ_mgmt)),
+    occ_prod_z    = as.numeric(scale(pct_occ_prod))
+  )
+
+m_bonus <- glm(cancelled_int ~ income_z + college_z + lths_z +
+                 urban_z + homeowner_z +
+                 knowledge_z + industrial_z +
+                 occ_mgmt_z + occ_prod_z + pushback_int,
+               data = dc_bonus, family = binomial)
+```
+
+Sample: **n=`r nrow(dc_bonus)`** Recently Proposed data centers (`r sum(dc_bonus$cancelled_int)` cancelled/suspended, `r sum(dc_bonus$cancelled_int == 0)` pending).
+
+```{r bonus-forest, fig.width = 11, fig.height = 6.5, echo = FALSE}
+bonus_or_singles <- map_dfr(BONUS_PRED_ORDER, function(v) {
+  m <- glm(as.formula(paste("cancelled_int ~", v)), data = dc_bonus, family = binomial)
+  tidy(m, exponentiate = TRUE, conf.int = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(panel = "Single-predictor models")
+})
+
+bonus_or_full <- tidy(m_bonus, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(panel = "Full model (all predictors)")
+
+bonus_or_all <- bind_rows(bonus_or_singles, bonus_or_full) |>
+  mutate(
+    term_clean = bonus_labels[term],
+    term_clean = factor(term_clean, levels = rev(bonus_labels)),
+    sig        = p.value < 0.05,
+    panel      = factor(panel, levels = c("Single-predictor models", "Full model (all predictors)"))
+  )
+
+ggplot(bonus_or_all, aes(x = estimate, y = term_clean, color = sig)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey30", linewidth = 0.8) +
+  geom_linerange(aes(xmin = conf.low, xmax = conf.high), linewidth = 2.5, alpha = 0.4) +
+  geom_point(size = 3.5) +
+  facet_wrap(~panel, ncol = 2, scales = "free_x") +
+  scale_color_manual(values = c("FALSE" = "grey55", "TRUE" = "#C62828"),
+                     labels = c("Not significant (p≥0.05)", "Significant (p<0.05)")) +
+  scale_x_log10(labels = label_number(accuracy = 0.1)) +
+  labs(title = "Predicting cancellation w/ the kitchen sink",
+       x = "Odds ratio (log scale)", y = NULL, color = NULL,
+       caption = "Sources: FracTracker & ACS 5-year 2024 (2020–2024), via scienceandpower.substack.com.") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title      = element_text(face = "bold"),
+        legend.position = "bottom",
+        strip.text      = element_text(face = "bold", size = 11),
+        panel.spacing   = unit(1.5, "lines"))
+```
+
+### Full model table
+
+```{r bonus-table, echo = FALSE}
+tidy(m_bonus, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    OR        = round(estimate, 3),
+    `95% CI`  = paste0("[", round(conf.low, 3), ", ", round(conf.high, 3), "]"),
+    p         = ifelse(p.value < 0.001, "< 0.001", sprintf("%.3f", p.value)),
+    Sig       = p.value < 0.05,
+    Predictor = bonus_labels[term]
+  ) |>
+  select(Predictor, OR, `95% CI`, p, Sig) |>
+  kable(align = c("l", "r", "r", "r", "c")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) |>
+  row_spec(0, bold = TRUE) |>
+  add_footnote(
+    paste0("Outcome = Cancelled/Suspended vs. Pending. Recently Proposed sites only. n = ",
+           nrow(dc_bonus), ". Model AIC = ", round(AIC(m_bonus), 1), "."),
+    notation = "none"
+  )
+```
+
+---
+
+## Methods & Housekeeping
+
+Unit of analysis is one data center—not necessarily one census tract, as some census tracts have multiple data centers.
+To support claims about "the average neighborhood," all analyses have been conducted using the median education, income, or homeownership statistic. Please don't report these results as describing "the average person living in a neighborhood with," because that English sentence strictly implies that you're talking about weighted means, which are a whole different thing.
+Because of changing data center siting demographics, fighting and spiking analyses for the full data set may confound corporate choices with community actions. For this reason, I strongly recommend circumscribing all inferences about fighting and spiking to the analyses of Recently Proposed data centers only.
+The "Kitchen Sink" analyses are liable to produce false positives, and all kitchen sink models without pushback are scientifically unsound: What I did there is called data dredging, which is a form of p-hacking, which is a form of ethically and epistemically problematic specifically because it produces false-positives. But because I’ve stacked the deck to find ‘statistical significance’ where all there really is noise, the two figures together support a scientifically, ethically, and epistemically sound and important point:
+
+Pushback gets data centers cancelled. Beyond that pushback, nothing about a neighborhood seems to matter.
+
+
+
+**Data sources:** ACS 2020–2024 5-year estimates (via U.S. Census Bureau API) and FracTracker Data Centers Database (via https://www.arcgis.com/apps/instant/sidebar/index.html?appid=fdb7678fb2e345eb8b0a3a49971240c4)
+
+**Methods:** All data center locations joined at demographic data at census tract ("neighborhood") level.
+
+**Notes:** Sample sizes vary slightly across demographics due to small-sample data censoring in public Census Bureau records.
+
+```{r data-summary, echo=FALSE}
+tibble(
+  Metric = c(
+    "Total records",
+    "Currently Operating",
+    "Recently Proposed",
+    "   ⤵ Pending",
+    "   ⤵ Cancelled/Suspended",
+    "With tract-level income data",
+    "With tract-level education data"
+  ),
+  N = c(
+    nrow(dc),
+    sum(dc$is_operating),
+    sum(dc$is_recently_proposed),
+    sum(dc$is_pending),
+    sum(dc$is_cancelled),
+    sum(!is.na(dc$income_tract)),
+    sum(!is.na(dc$pct_college_tract))
+  )
+) |>
+  kable(format.args = list(big.mark = ","), align = "lr") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+### Labels & Definitions
+
+Among all sites in the FracTracker dataset, labels are used to analyze differences between existing data centers and those in the new wave. These differences are presumed to be largely differences in corporate decision-making.
+
+**"Currently Operating"** includes sites labeled in the downloaded data as: *Operating; Expanding*
+
+**"Recently Proposed"** includes sites labeled in the downloaded data as: *Proposed; Approved/Permitted/Under construction; Suspended; Cancelled*
+
+Among "Recently Proposed" sites, two labels are used to analyze differences in proposal status.
+
+**"Cancelled/Suspended"** includes sites labeled in the downloaded data as: *Suspended; Cancelled*
+
+**"Pending"** includes all other "Recently Proposed" sites, labeled in the downloaded data as: *Proposed; Approved/Permitted/Under construction*
+
+The relationship between corporate decision-making and proposal status may be influenced by community response. That gives us two more labels:
+
+**"With Pushback"** includes sites where community opposition is recorded in the FracTracker data. One Recently Proposed site had a missing value for this field; independent research confirmed it faced community opposition and it is included in this group.
+
+**"Without Pushback"** includes all other sites.
+
+Variables are measured at the census tract level and represent the neighborhood in which each facility is located. All neighborhood-level figures are compared against national figures from the same ACS survey. Variables are summarized as follows:
+
+- **Education:** Percentage of adults 25+ with a bachelor's degree or higher (ACS B15003)
+- **Income:** Median income (ACS B19013)
+- **Homeownership:** Percentage of occupied housing units that are owner-occupied (ACS B25003)
+
+All group figures are unweighted medians across facilities (i.e., the median data center's neighborhood). National figures are aggregate ACS estimates for the U.S. as a whole.

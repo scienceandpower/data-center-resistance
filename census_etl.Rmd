@@ -1,0 +1,340 @@
+---
+title: "Census ETL: Tract-Level ACS Data for Data Center Geographies"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyverse)
+library(tidycensus)
+library(tigris)
+library(sf)
+library(knitr)
+library(kableExtra)
+
+options(tigris_use_cache = TRUE)
+sf_use_s2(FALSE)
+
+DATA_DIR <- "data"
+OUT_DIR  <- "data"
+
+ACS_YEAR <- 2024
+```
+
+## Overview
+
+This file pulls American Community Survey (ACS 5-year, `r ACS_YEAR`, covering 2020–2024) data at the **census tract** level for the subset of tracts that contain at least one data center in the FracTracker dataset. The result is a single wide CSV with one row per data center and all FracTracker fields preserved alongside the Census variables used in `data_center_resistance_analysis.Rmd`. 
+
+Variables focus on "the class politics of data center fights," as described by Brian Merchant, and tests Holly Buck's hypothesis that that resistance to AI data centers circa 2026 is being led by "educated middle-class people — including exurban and rural residents but also professionals who work in knowledge jobs." 
+
+**Naming convention:** `{variable}_tract` — e.g., `income_tract`, `education_bachelors_tract`.
+
+**`urban_rural_tract_etl.csv`** is a pre-built companion file committed alongside this ETL output. It contains the share of each census tract's area falling within a 2020 Census-defined urban boundary, sourced from the U.S. Census Bureau's 2020 urban area definitions.
+
+---
+
+## Variable Definitions
+
+```{r define-vars}
+vars_base <- c(
+  income    = "B19013_001",
+  own_n     = "B25003_002",
+  ten_denom = "B25003_001"
+)
+
+# B15003: Educational attainment, pop 25+
+# e01=total; e02–e16=<HS; e22=bachelor's; e23=master's; e24=professional; e25=doctorate
+vars_educ <- c(
+  setNames(
+    paste0("B15003_", sprintf("%03d", c(1:16, 22:25))),
+    paste0("e", sprintf("%02d", c(1:16, 22:25)))
+  )
+)
+
+# C24070: Industry, civilian employed 16+
+# i01=total; i03=construction; i04=manufacturing; i07=transport/utilities;
+# i08=info; i09=finance/RE; i10=professional
+vars_ind <- c(
+  i01 = "C24070_001",
+  i03 = "C24070_003",
+  i04 = "C24070_004",
+  i07 = "C24070_007",
+  i08 = "C24070_008",
+  i09 = "C24070_009",
+  i10 = "C24070_010"
+)
+
+# C24060: Broad occupation, civilian employed 16+
+# o01=total; o02=mgmt/sci/arts; o06=production/transport
+vars_occ <- c(
+  o01 = "C24060_001",
+  o02 = "C24060_002",
+  o06 = "C24060_006"
+)
+
+all_vars <- c(vars_base, vars_educ, vars_ind, vars_occ)
+```
+
+The table below shows all derived output variables and their source ACS tables.
+
+```{r var-table, echo=FALSE}
+tribble(
+  ~`Output variable`,              ~`ACS table`,  ~`Description`,
+  "income",                        "B19013",       "Median household income",
+  "homeowner",                     "B25003",       "Owner-occupancy rate",
+  "education_lths",                "B15003",       "Share < high school",
+  "education_bachelors",           "B15003",       "Share bachelor's degree",
+  "education_grad",                "B15003",       "Share graduate / professional degree",
+  "industry_construction",         "C24070",       "Employment share in construction",
+  "industry_manufacturing",        "C24070",       "Employment share in manufacturing",
+  "industry_transport",            "C24070",       "Employment share in transport/utilities",
+  "industry_info",                 "C24070",       "Employment share in information",
+  "industry_finance",              "C24070",       "Employment share in finance/RE",
+  "industry_professional",         "C24070",       "Employment share in professional services",
+  "occupation_mgmt",               "C24060",       "Employment share in mgmt/sci/arts",
+  "occupation_production",         "C24060",       "Employment share in production/transport"
+) |>
+  kable(align = "lll") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+---
+
+## Loading FracTracker Data
+
+Data stored locally and uploaded to GitHub after manual download from https://www.arcgis.com/apps/instant/sidebar/index.html?appid=fdb7678fb2e345eb8b0a3a49971240c4
+
+```{r load-dc}
+dc_raw <- read_csv(
+  file.path(DATA_DIR, "Data_Centers_Database - FracTracker Data Centers.csv"),
+  show_col_types = FALSE
+)
+
+dc_sf <- dc_raw |>
+  rename(frac_city = city) |>
+  mutate(dc_id = row_number()) |>
+  filter(!is.na(lat), !is.na(long)) |>
+  st_as_sf(coords = c("long", "lat"), crs = 4326, remove = FALSE)
+
+n_raw   <- nrow(dc_raw)
+n_valid <- nrow(dc_sf)
+dc_states <- sort(unique(dc_sf$state))
+```
+
+- **Total FracTracker records:** `r n_raw`
+- **Records with valid coordinates:** `r n_valid` (`r scales::percent(n_valid/n_raw, 1)`)
+- **States represented:** `r length(dc_states)` — `r paste(dc_states, collapse = ", ")`
+
+---
+
+## Tract Boundaries
+
+```{r boundaries, cache=TRUE}
+tract_geo <- map_dfr(
+  dc_states,
+  ~tracts(state = .x, cb = TRUE, year = ACS_YEAR, progress_bar = FALSE)
+) |>
+  st_transform(4326) |>
+  transmute(geo_tract_geoid = GEOID)
+```
+
+---
+
+## Spatial Join
+
+Each data center point is joined to tract boundaries using point-in-polygon (`st_within`).
+
+```{r spatial-joins, cache=TRUE, dependson="boundaries"}
+dc_geo <- dc_sf |>
+  st_join(tract_geo, join = st_within) |>
+  group_by(dc_id) |>   # deduplicate boundary edge cases
+  slice(1) |>
+  ungroup()
+```
+
+```{r coverage-table, echo=FALSE}
+n <- nrow(dc_geo)
+tibble(
+  Level   = "Tract",
+  Matched = sum(!is.na(dc_geo$geo_tract_geoid)),
+  Total   = n
+) |>
+  mutate(`Match rate` = scales::percent(Matched / Total, 0.1)) |>
+  kable(align = "lrr") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+---
+
+## ACS Helper Function
+
+```{r process-fn}
+process_acs <- function(raw) {
+  raw |>
+    select(GEOID, ends_with("E")) |>
+    mutate(
+      income              = incomeE,
+      homeowner           = own_nE    / ten_denomE,
+      education_lths      = (e02E + e03E + e04E + e05E + e06E + e07E + e08E +
+                             e09E + e10E + e11E + e12E + e13E + e14E + e15E + e16E) / e01E,
+      education_bachelors = e22E / e01E,
+      education_grad      = (e23E + e24E + e25E) / e01E,
+      industry_construction  = i03E / i01E,
+      industry_manufacturing = i04E / i01E,
+      industry_transport     = i07E / i01E,
+      industry_info          = i08E / i01E,
+      industry_finance       = i09E / i01E,
+      industry_professional  = i10E / i01E,
+      occupation_mgmt        = o02E / o01E,
+      occupation_production  = o06E / o01E
+    ) |>
+    select(GEOID,
+           income, homeowner,
+           starts_with("education_"),
+           starts_with("industry_"),
+           starts_with("occupation_")) |>
+    mutate(across(where(is.numeric), ~if_else(is.finite(.x), .x, NA_real_)))
+}
+```
+
+---
+
+## ACS Tract-Level Data Pull
+
+```{r acs-tract, cache=TRUE, dependson="spatial-joins"}
+tract_geoids_needed <- dc_geo |> st_drop_geometry() |>
+  filter(!is.na(geo_tract_geoid)) |> pull(geo_tract_geoid) |> unique()
+
+county_combos <- tibble(geoid = tract_geoids_needed) |>
+  transmute(
+    state_fips  = substr(geoid, 1, 2),
+    county_fips = substr(geoid, 3, 5)
+  ) |>
+  distinct()
+
+acs_tract <- pmap_dfr(county_combos, function(state_fips, county_fips) {
+  get_acs("tract",
+          state     = state_fips,
+          county    = county_fips,
+          variables = all_vars,
+          year      = ACS_YEAR,
+          survey    = "acs5",
+          output    = "wide")
+}) |>
+  filter(GEOID %in% tract_geoids_needed) |>
+  process_acs()
+```
+
+`r nrow(acs_tract)` tracts pulled.
+
+---
+
+## Join & Finalize Dataset
+
+```{r join, dependson="acs-tract"}
+dc_final <- dc_geo |>
+  st_drop_geometry() |>
+  left_join(
+    acs_tract |>
+      rename_with(~paste0(.x, "_tract"), .cols = -GEOID) |>
+      rename(geo_tract_geoid = GEOID),
+    by = "geo_tract_geoid"
+  )
+```
+
+**Final dataset dimensions:** `r nrow(dc_final)` rows × `r ncol(dc_final)` columns.
+
+### Variable completeness
+
+```{r completeness, echo=FALSE}
+census_cols <- names(dc_final)[str_detect(names(dc_final), "_tract$")]
+
+dc_final |>
+  summarise(across(all_of(census_cols), ~mean(!is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_complete") |>
+  mutate(`% complete` = scales::percent(pct_complete, 0.1)) |>
+  select(variable, `% complete`) |>
+  kable(align = "lr") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+### Sample rows (key columns)
+
+```{r sample-output, echo=FALSE}
+dc_final |>
+  filter(!is.na(income_tract)) |>
+  select(facility_name, frac_city, state,
+         income_tract, homeowner_tract,
+         education_bachelors_tract, education_grad_tract, education_lths_tract) |>
+  slice_sample(n = 10) |>
+  mutate(across(where(is.numeric), ~round(.x, 3))) |>
+  kable() |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                font_size = 11, full_width = TRUE) |>
+  scroll_box(width = "100%")
+```
+
+---
+
+## National Benchmarks
+
+National-level ACS estimates used as reference lines in the analysis. Saved separately so `data_center_resistance_analysis.Rmd` requires no Census API key to knit.
+
+```{r nat-benchmarks}
+nat_official <- get_acs(
+  geography = "us",
+  variables = c(
+    income     = "B19013_001",
+    educ_tot   = "B15003_001",
+    educ_ba    = "B15003_022",
+    educ_ma    = "B15003_023",
+    educ_prof  = "B15003_024",
+    educ_phd   = "B15003_025",
+    own_occ    = "B25003_002",
+    tenure_tot = "B25003_001"
+  ),
+  year   = ACS_YEAR,
+  survey = "acs5",
+  output = "wide"
+)
+
+nat_benchmarks <- tibble(
+  nat_income    = nat_official$incomeE,
+  nat_college   = (nat_official$educ_baE + nat_official$educ_maE +
+                   nat_official$educ_profE + nat_official$educ_phdE) /
+                   nat_official$educ_totE,
+  nat_homeowner = nat_official$own_occE / nat_official$tenure_totE
+)
+```
+
+---
+
+## Save Output
+
+```{r save}
+write_csv(dc_final,       file.path(OUT_DIR, "datacenter_census_etl.csv"))
+write_csv(nat_benchmarks, file.path(OUT_DIR, "nat_benchmarks.csv"))
+```
+
+**Files written to** `r OUT_DIR`:
+
+| File | Description |
+|---|---|
+| `datacenter_census_etl.csv` | One row per data center, all FracTracker fields + tract-level Census variables |
+| `nat_benchmarks.csv` | National ACS benchmarks: median income, college rate, homeownership rate |
+
+```{r session-info, echo=FALSE}
+sessionInfo()
+```
